@@ -42,3 +42,10 @@ PYTHONPATH=src python3 -m urban_network.api --database network.sqlite3 --host 12
 ```
 
 `GET /health` 返回服务状态，其余接口使用 JSON 和 `Authorization: Bearer <token>` 会话，支持管段登记、读数上报、风险查询、工单创建和应急资源分配。
+
+读数时间（`observed_at`）在接收边界统一校验并保存为 UTC 规范形式（`Z` 结尾）；同一绝对时刻按 `(segment_id, sensor_id, observed_at)` 去重，与网关使用 `+08:00` 还是 `Z` 无关。连接数据库时会自动把历史带偏移记录迁移为 UTC，审计事件保持不变。查询接口：
+
+- `GET /segments/<id>/readings?from=<iso>&to=<iso>&limit=<n>&cursor=<c>`：按真实时间顺序分页，窗口起止与游标按绝对时刻解释，任意偏移表示结果一致；
+- `GET /segments/<id>/readings/latest`：最新读数；
+- `GET /segments/<id>/risk`：风险报告，含 `latest_reading`；
+- `GET /audit/<entity_type>/<entity_id>`：审计事件。

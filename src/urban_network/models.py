@@ -3,13 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
+from .clock import parse_utc
 
 def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 def parse_time(value: str) -> datetime:
-    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    return (parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
+    return parse_utc(value)
 
 @dataclass(frozen=True)
 class Segment:

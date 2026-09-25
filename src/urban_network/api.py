@@ -2,6 +2,7 @@
 from __future__ import annotations
 import argparse,json
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
+from urllib.parse import parse_qs,urlsplit
 from .models import Reading,Segment
 from .service import NetworkService
 class Handler(BaseHTTPRequestHandler):
@@ -11,9 +12,18 @@ class Handler(BaseHTTPRequestHandler):
     def _token(self):return self.headers.get("Authorization","").removeprefix("Bearer ")
     def do_GET(self):
         try:
-            if self.path=="/health":return self._send(200,{"status":"ok","service":"urban-network"})
-            if self.path.startswith("/segments/") and self.path.endswith("/risk"):return self._send(200,self.service.risk_report(self._token(),self.path.split("/")[2]))
-            if self.path.startswith("/segments/"):return self._send(200,self.service.segment(self._token(),self.path.split("/",2)[2]))
+            split=urlsplit(self.path); path=split.path; query=parse_qs(split.query)
+            if path=="/health":return self._send(200,{"status":"ok","service":"urban-network"})
+            if path.startswith("/segments/") and path.endswith("/risk"):return self._send(200,self.service.risk_report(self._token(),path.split("/")[2]))
+            if path.startswith("/segments/") and path.endswith("/readings/latest"):
+                sid=path.split("/")[2]; return self._send(200,{"segment_id":sid,"latest_reading":self.service.latest_reading(self._token(),sid)})
+            if path.startswith("/segments/") and path.endswith("/readings"):
+                param=lambda name,default=None: query.get(name,[default])[0]
+                return self._send(200,self.service.list_readings(self._token(),path.split("/")[2],start=param("from"),end=param("to"),limit=param("limit",100),cursor=param("cursor")))
+            if path.startswith("/segments/"):return self._send(200,self.service.segment(self._token(),path.split("/",2)[2]))
+            if path.startswith("/audit/"):
+                parts=path.split("/",3)
+                if len(parts)==4:return self._send(200,{"entity_type":parts[2],"entity_id":parts[3],"events":self.service.audit_events(self._token(),parts[2],parts[3])})
             return self._send(404,{"error":"not found"})
         except PermissionError as e:return self._send(403,{"error":str(e)})
         except Exception as e:return self._send(400,{"error":str(e)})

@@ -2,6 +2,7 @@
 from __future__ import annotations
 import hashlib,uuid
 from .auth import Auth
+from .clock import canonical_time,epoch_micros
 from .models import Reading,Segment,as_dict,utcnow
 from .risk import leak_probability,score_reading
 from .storage import audit,connect,rows,transaction
@@ -21,18 +22,45 @@ class NetworkService:
         if not row:raise KeyError(segment_id)
         return dict(row)
     def ingest_reading(self,token,reading):
-        actor=self.auth.require(token,"measure"); reading.validate(); seg=self.db.execute("SELECT criticality FROM segments WHERE segment_id=?",(reading.segment_id,)).fetchone()
+        actor=self.auth.require(token,"measure"); reading.validate(); observed_at=canonical_time(reading.observed_at); seg=self.db.execute("SELECT criticality FROM segments WHERE segment_id=?",(reading.segment_id,)).fetchone()
         if not seg:raise KeyError(reading.segment_id)
-        risk=score_reading(reading.pressure_kpa,reading.flow_lps,reading.acoustic_db,seg[0]); fingerprint=hashlib.sha256(f"{reading.segment_id}|{reading.sensor_id}|{reading.observed_at}".encode()).hexdigest()
+        risk=score_reading(reading.pressure_kpa,reading.flow_lps,reading.acoustic_db,seg[0]); fingerprint=hashlib.sha256(f"{reading.segment_id}|{reading.sensor_id}|{observed_at}".encode()).hexdigest()
         with transaction(self.db):
             if self.db.execute("SELECT reading_id FROM readings WHERE reading_id=?",(reading.reading_id,)).fetchone(): return {"reading_id":reading.reading_id,"duplicate":True,"risk":as_dict(risk)}
-            self.db.execute("INSERT INTO readings VALUES(?,?,?,?,?,?,?)",(reading.reading_id,reading.segment_id,reading.sensor_id,reading.pressure_kpa,reading.flow_lps,reading.acoustic_db,reading.observed_at)); alert_id=None
+            same=self.db.execute("SELECT reading_id FROM readings WHERE segment_id=? AND sensor_id=? AND observed_at=?",(reading.segment_id,reading.sensor_id,observed_at)).fetchone()
+            if same:return {"reading_id":same[0],"duplicate":True,"risk":as_dict(risk)}
+            self.db.execute("INSERT INTO readings VALUES(?,?,?,?,?,?,?)",(reading.reading_id,reading.segment_id,reading.sensor_id,reading.pressure_kpa,reading.flow_lps,reading.acoustic_db,observed_at)); alert_id=None
             if risk.severity in {"high","critical"}:
                 alert_id="alert-"+fingerprint[:18]; self.db.execute("INSERT OR IGNORE INTO alerts VALUES(?,?,?,?,?,?,?,?)",(alert_id,reading.segment_id,fingerprint,risk.severity,risk.score,"open",utcnow(),None))
             audit(self.db,"reading",reading.reading_id,"ingested",actor.user_id,{"risk":as_dict(risk),"alert_id":alert_id})
         return {"reading_id":reading.reading_id,"duplicate":False,"risk":as_dict(risk),"alert_id":alert_id}
+    def list_readings(self,token,segment_id,start=None,end=None,limit=100,cursor=None):
+        self.auth.require(token,"read")
+        if not self.db.execute("SELECT 1 FROM segments WHERE segment_id=?",(segment_id,)).fetchone():raise KeyError(segment_id)
+        start_us=epoch_micros(start) if start else None; end_us=epoch_micros(end) if end else None
+        if start_us is not None and end_us is not None and start_us>end_us:raise ValueError("query window start must not be after end")
+        try: limit=int(limit)
+        except (TypeError,ValueError): raise ValueError("limit must be an integer") from None
+        if not 1<=limit<=500:raise ValueError("limit must be between 1 and 500")
+        clauses=["segment_id=?"]; args=[segment_id]
+        if start_us is not None: clauses.append("epoch_us(observed_at)>=?"); args.append(start_us)
+        if end_us is not None: clauses.append("epoch_us(observed_at)<=?"); args.append(end_us)
+        if cursor:
+            try: cursor_time,cursor_id=cursor.split("|",1); cursor_us=epoch_micros(cursor_time)
+            except ValueError: raise ValueError("invalid pagination cursor") from None
+            if not cursor_id.strip():raise ValueError("invalid pagination cursor")
+            clauses.append("(epoch_us(observed_at)>? OR (epoch_us(observed_at)=? AND reading_id>?))"); args.extend((cursor_us,cursor_us,cursor_id))
+        query="SELECT * FROM readings WHERE "+" AND ".join(clauses)+" ORDER BY epoch_us(observed_at),reading_id LIMIT ?"
+        batch=rows(self.db,query,(*args,limit+1)); page=batch[:limit]
+        next_cursor=f"{page[-1]['observed_at']}|{page[-1]['reading_id']}" if page and len(batch)>limit else None
+        return {"segment_id":segment_id,"readings":page,"next_cursor":next_cursor}
+    def latest_reading(self,token,segment_id):
+        self.auth.require(token,"read")
+        if not self.db.execute("SELECT 1 FROM segments WHERE segment_id=?",(segment_id,)).fetchone():raise KeyError(segment_id)
+        row=self.db.execute("SELECT * FROM readings WHERE segment_id=? ORDER BY epoch_us(observed_at) DESC,reading_id DESC LIMIT 1",(segment_id,)).fetchone()
+        return dict(row) if row else None
     def risk_report(self,token,segment_id):
-        self.auth.require(token,"analyze"); readings=rows(self.db,"SELECT * FROM readings WHERE segment_id=? ORDER BY observed_at",(segment_id,)); alerts=rows(self.db,"SELECT * FROM alerts WHERE segment_id=? ORDER BY created_at",(segment_id,)); return {"segment_id":segment_id,"readings":len(readings),"alerts":alerts,"leak_probability":leak_probability(alerts)}
+        self.auth.require(token,"analyze"); readings=rows(self.db,"SELECT * FROM readings WHERE segment_id=? ORDER BY epoch_us(observed_at),reading_id",(segment_id,)); alerts=rows(self.db,"SELECT * FROM alerts WHERE segment_id=? ORDER BY created_at",(segment_id,)); return {"segment_id":segment_id,"readings":len(readings),"alerts":alerts,"leak_probability":leak_probability(alerts),"latest_reading":readings[-1] if readings else None}
     def create_work_order(self,token,segment_id,alert_id,assignee,priority=3):
         actor=self.auth.require(token,"work_order")
         if not assignee.strip() or not 1<=priority<=5:raise ValueError("assignee and priority are invalid")
