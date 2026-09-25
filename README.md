@@ -41,4 +41,4 @@ PYTHONPATH=src python3 -m urban_network.acceptance --workspace .
 PYTHONPATH=src python3 -m urban_network.api --database network.sqlite3 --host 127.0.0.1 --port 8080
 ```
 
-`GET /health` 返回服务状态，其余接口使用 JSON 和 `Authorization: Bearer <token>` 会话，支持管段登记、读数上报、风险查询、工单创建和应急资源分配。
+`GET /health` 返回服务状态，其余接口使用 JSON 和 `Authorization: Bearer <token>` 会话，支持管段登记、读数上报、风险查询、工单创建和应急资源分配。读数时间戳在接收边界统一校验并转换为 UTC 存储（数据库中已有的带偏移记录在连接时自动迁移，审计事件保持不变），同一绝对时刻的去重行为与表示形式无关。`GET /segments/<id>/readings` 按真实时间顺序分页返回读数，`start`/`end`/`cursor`/`limit` 参数均按绝对时刻解释；`GET /segments/<id>/risk` 返回最新读数与泄漏概率；`GET /audit/<entity_type>/<entity_id>` 返回实体的审计事件。

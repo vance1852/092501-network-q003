@@ -4,6 +4,7 @@ import json, sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Iterator
+from .models import canonical_utc
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users(user_id TEXT PRIMARY KEY,role TEXT NOT NULL,salt TEXT NOT NULL,password_hash TEXT NOT NULL,active INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL);
@@ -17,8 +18,24 @@ CREATE TABLE IF NOT EXISTS allocations(allocation_id TEXT PRIMARY KEY,resource_i
 CREATE TABLE IF NOT EXISTS audit_events(event_id INTEGER PRIMARY KEY AUTOINCREMENT,entity_type TEXT NOT NULL,entity_id TEXT NOT NULL,action TEXT NOT NULL,actor TEXT NOT NULL,payload TEXT NOT NULL,created_at TEXT NOT NULL);
 """
 def utcnow() -> str: return datetime.now(timezone.utc).isoformat()
+def migrate_readings_to_utc(db: sqlite3.Connection) -> dict:
+    """把历史读数的 observed_at 规范化为 UTC 表示。
+
+    同一绝对时刻若仅因表示形式不同而重复，按既定去重语义保留最早写入的一行；
+    审计事件不被修改。可重复执行。
+    """
+    migrated=0; dropped=0
+    legacy=db.execute("SELECT rowid,segment_id,sensor_id,observed_at FROM readings ORDER BY rowid").fetchall()
+    for row in legacy:
+        try: canonical=canonical_utc(row["observed_at"])
+        except (TypeError,ValueError): continue
+        if canonical==row["observed_at"]: continue
+        conflict=db.execute("SELECT 1 FROM readings WHERE segment_id=? AND sensor_id=? AND observed_at=?",(row["segment_id"],row["sensor_id"],canonical)).fetchone()
+        if conflict: db.execute("DELETE FROM readings WHERE rowid=?",(row["rowid"],)); dropped+=1
+        else: db.execute("UPDATE readings SET observed_at=? WHERE rowid=?",(canonical,row["rowid"])); migrated+=1
+    return {"migrated":migrated,"duplicates_dropped":dropped}
 def connect(path: str = ":memory:") -> sqlite3.Connection:
-    db=sqlite3.connect(path,timeout=10); db.row_factory=sqlite3.Row; db.execute("PRAGMA foreign_keys=ON"); db.execute("PRAGMA journal_mode=WAL"); db.executescript(SCHEMA); db.commit(); return db
+    db=sqlite3.connect(path,timeout=10,check_same_thread=False); db.row_factory=sqlite3.Row; db.execute("PRAGMA foreign_keys=ON"); db.execute("PRAGMA journal_mode=WAL"); db.executescript(SCHEMA); migrate_readings_to_utc(db); db.commit(); return db
 @contextmanager
 def transaction(db: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     try: db.execute("BEGIN IMMEDIATE"); yield db; db.commit()

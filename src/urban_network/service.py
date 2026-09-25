@@ -1,8 +1,9 @@
 """协调管网监测、告警、工单和应急资源分配的应用服务。"""
 from __future__ import annotations
 import hashlib,uuid
+from dataclasses import replace
 from .auth import Auth
-from .models import Reading,Segment,as_dict,utcnow
+from .models import Reading,Segment,as_dict,canonical_utc,utcnow
 from .risk import leak_probability,score_reading
 from .storage import audit,connect,rows,transaction
 class NetworkService:
@@ -21,7 +22,7 @@ class NetworkService:
         if not row:raise KeyError(segment_id)
         return dict(row)
     def ingest_reading(self,token,reading):
-        actor=self.auth.require(token,"measure"); reading.validate(); seg=self.db.execute("SELECT criticality FROM segments WHERE segment_id=?",(reading.segment_id,)).fetchone()
+        actor=self.auth.require(token,"measure"); reading.validate(); reading=replace(reading,observed_at=canonical_utc(reading.observed_at)); seg=self.db.execute("SELECT criticality FROM segments WHERE segment_id=?",(reading.segment_id,)).fetchone()
         if not seg:raise KeyError(reading.segment_id)
         risk=score_reading(reading.pressure_kpa,reading.flow_lps,reading.acoustic_db,seg[0]); fingerprint=hashlib.sha256(f"{reading.segment_id}|{reading.sensor_id}|{reading.observed_at}".encode()).hexdigest()
         with transaction(self.db):
@@ -31,8 +32,26 @@ class NetworkService:
                 alert_id="alert-"+fingerprint[:18]; self.db.execute("INSERT OR IGNORE INTO alerts VALUES(?,?,?,?,?,?,?,?)",(alert_id,reading.segment_id,fingerprint,risk.severity,risk.score,"open",utcnow(),None))
             audit(self.db,"reading",reading.reading_id,"ingested",actor.user_id,{"risk":as_dict(risk),"alert_id":alert_id})
         return {"reading_id":reading.reading_id,"duplicate":False,"risk":as_dict(risk),"alert_id":alert_id}
+    def list_readings(self,token,segment_id,start=None,end=None,cursor=None,limit=100):
+        """按真实时间顺序分页返回读数；窗口边界和游标统一按 UTC 时刻解释，与表示形式无关。"""
+        self.auth.require(token,"read")
+        try: limit=int(limit)
+        except (TypeError,ValueError): raise ValueError("limit must be an integer")
+        limit=max(1,min(500,limit)); clauses=["segment_id=?"]; args=[segment_id]
+        start_utc=canonical_utc(start) if start else None; end_utc=canonical_utc(end) if end else None
+        if start_utc and end_utc and start_utc>end_utc: raise ValueError("query window start must not be after end")
+        if start_utc: clauses.append("observed_at>=?"); args.append(start_utc)
+        if end_utc: clauses.append("observed_at<=?"); args.append(end_utc)
+        if cursor:
+            mark,sep,cursor_id=str(cursor).partition("|")
+            if not sep or not cursor_id: raise ValueError("cursor is invalid")
+            cursor_utc=canonical_utc(mark); clauses.append("(observed_at>? OR (observed_at=? AND reading_id>?))"); args.extend((cursor_utc,cursor_utc,cursor_id))
+        fetched=rows(self.db,"SELECT * FROM readings WHERE "+" AND ".join(clauses)+" ORDER BY observed_at,reading_id LIMIT "+str(limit+1),args)
+        page=fetched[:limit]; next_cursor=None
+        if page and len(fetched)>limit: next_cursor=f"{page[-1]['observed_at']}|{page[-1]['reading_id']}"
+        return {"segment_id":segment_id,"readings":page,"next_cursor":next_cursor}
     def risk_report(self,token,segment_id):
-        self.auth.require(token,"analyze"); readings=rows(self.db,"SELECT * FROM readings WHERE segment_id=? ORDER BY observed_at",(segment_id,)); alerts=rows(self.db,"SELECT * FROM alerts WHERE segment_id=? ORDER BY created_at",(segment_id,)); return {"segment_id":segment_id,"readings":len(readings),"alerts":alerts,"leak_probability":leak_probability(alerts)}
+        self.auth.require(token,"analyze"); total=self.db.execute("SELECT COUNT(*) FROM readings WHERE segment_id=?",(segment_id,)).fetchone()[0]; latest=self.db.execute("SELECT * FROM readings WHERE segment_id=? ORDER BY observed_at DESC,reading_id DESC LIMIT 1",(segment_id,)).fetchone(); alerts=rows(self.db,"SELECT * FROM alerts WHERE segment_id=? ORDER BY created_at",(segment_id,)); return {"segment_id":segment_id,"readings":total,"alerts":alerts,"leak_probability":leak_probability(alerts),"latest_reading":dict(latest) if latest else None}
     def create_work_order(self,token,segment_id,alert_id,assignee,priority=3):
         actor=self.auth.require(token,"work_order")
         if not assignee.strip() or not 1<=priority<=5:raise ValueError("assignee and priority are invalid")
